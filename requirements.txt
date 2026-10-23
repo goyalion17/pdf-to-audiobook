@@ -1,0 +1,6 @@
+pypdf
+edge-tts
+customtkinter
+pygame-ce
+pypdfium2
+ocrmac; sys_platform == "darwin"
