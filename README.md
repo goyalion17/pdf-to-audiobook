@@ -4,6 +4,10 @@ Too tired to read? This Python project takes a PDF file, extracts its text and c
 
 Text-to-speech comes from Microsoft Edge's online neural voices via [edge-tts](https://github.com/rany2/edge-tts). They sound natural, cover 70+ languages (including Ukrainian and German) and need **no API key, no account and no credit card**.
 
+<p align="center">
+  <img src="screenshot.png" alt="The PDF to Audiobook app: a book chosen, British voice Sonia at 1.25× speed, pages 5-6 converted to 3:18 of audio and playing" width="440">
+</p>
+
 ## Features
 
 - Desktop app: choose a PDF, convert it, listen right in the app and save the MP3 to your computer
@@ -19,6 +23,8 @@ Text-to-speech comes from Microsoft Edge's online neural voices via [edge-tts](h
 ## Setup
 
 ```bash
+git clone https://github.com/goyalion17/pdf-to-audiobook.git
+cd pdf-to-audiobook
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -78,6 +84,7 @@ Google and Amazon both work well, but need a credit card on file. edge-tts gives
 ├── main.py           # PDF text extraction, text cleanup, TTS and the command-line interface
 ├── tests/            # pytest tests for main.py
 ├── sample.pdf        # a short test document
+├── screenshot.png
 ├── requirements.txt  # pypdf, edge-tts, customtkinter, pygame-ce, pypdfium2, ocrmac
 ├── requirements-dev.txt  # + pytest
 ├── pytest.ini
