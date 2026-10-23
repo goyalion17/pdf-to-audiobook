@@ -1,13 +1,15 @@
 """PDF to Audiobook: desktop app.
 
 Choose a PDF, turn it into speech, listen to it right in the app and save the MP3.
+The app remembers the last audiobook and where you stopped listening.
 Reading the PDF and text-to-speech come from main.py.
 """
 
+import json
 import os
 import queue
 import shutil
-import tempfile
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -51,6 +53,14 @@ VOICES = {
 SPEEDS = (("-25%", "0.75×"), ("+0%", "1×"), ("+25%", "1.25×"), ("+50%", "1.5×"))
 BYTES_PER_SECOND = 48_000 / 8   # edge-tts sends 48 kbit/s MP3, so file size tells the duration
 TICK_MS = 200
+SAVE_EVERY = 50                 # ticks (10 s): how often the listening position is saved while playing
+
+# The last audiobook and the listening position survive restarts
+DATA_DIR = (Path.home() / "Library/Application Support/PDF to Audiobook" if sys.platform == "darwin"
+            else Path.home() / ".local/share/pdf-to-audiobook")
+AUDIO_FILE = DATA_DIR / "audiobook.mp3"
+NEW_AUDIO_FILE = DATA_DIR / "converting.mp3"    # becomes AUDIO_FILE once a conversion succeeds
+STATE_FILE = DATA_DIR / "state.json"
 
 
 def font(size, weight="normal", family=UI_FONT):
@@ -58,8 +68,9 @@ def font(size, weight="normal", family=UI_FONT):
 
 
 def format_time(seconds):
-    seconds = int(seconds)
-    return f"{seconds // 60}:{seconds % 60:02d}"
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
 class Segmented(ctk.CTkFrame):
@@ -96,21 +107,23 @@ class AudiobookApp:
         self.root.configure(fg_color=BG)
         pygame.mixer.init()
 
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.pdf_path = None
-        self.audio_path = None      # the latest converted MP3, in a temp folder until saved
+        self.audio_path = None      # AUDIO_FILE once there is something to play
         self.audio_name = None      # suggested file name when saving
         self.duration = 0.0
         self.offset = 0.0           # second of the audio where the current play() started
         self.state = "stopped"      # "stopped", "playing" or "paused"
         self.dragging = False       # the user is moving the position slider
         self.saved = True           # False while there is converted audio that hasn't been saved
-        self.conversions = 0
         self.cancel_event = None    # set while converting; .set() asks the conversion to stop
         self.events = queue.Queue()  # messages from the conversion thread
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="audiobook-"))
+        self.ticks = 0
+        self.tick_job = None
 
         self.build()
         self.set_player_enabled(False)
+        self.restore_session()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.createcommand("::tk::mac::Quit", self.quit)    # Cmd+Q on macOS
         self.tick()
@@ -228,20 +241,54 @@ class AudiobookApp:
     def set_status(self, text, color=MUTED):
         self.status_label.configure(text=text, text_color=color)
 
+    # ---------- Remembering the last session ----------
+    def restore_session(self):
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (OSError, ValueError):
+            return                      # first start, or the file is damaged: start fresh
+        if state.get("voice") in VOICES:
+            self.voice_menu.set(state["voice"])
+        if state.get("speed") in self.speed.buttons:
+            self.speed.select(state["speed"])
+        if state.get("pdf") and Path(state["pdf"]).is_file():
+            self.set_pdf(Path(state["pdf"]))
+        if AUDIO_FILE.is_file() and state.get("name"):
+            self.load_audio(state["name"], state.get("position", 0), state.get("saved", True))
+            where = f"continue from {format_time(self.offset)}" if self.offset else "press ▶ to listen"
+            self.set_status(f"Welcome back! {self.audio_name}  ·  {where}")
+
+    def save_state(self):
+        state = {
+            "pdf": str(self.pdf_path) if self.pdf_path else None,
+            "voice": self.voice_menu.get(),
+            "speed": self.speed.value,
+            "name": self.audio_name if self.audio_path else None,
+            "position": round(self.position(), 1),
+            "saved": self.saved,
+        }
+        try:
+            STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+        except OSError:
+            pass                        # not worth interrupting the listener for
+
     # ---------- PDF & conversion ----------
     def choose_pdf(self):
         path = filedialog.askopenfilename(title="Choose a PDF", filetypes=[("PDF files", "*.pdf")])
-        if not path:
-            return
+        if path and self.set_pdf(Path(path)):
+            self.set_status("Ready to convert")
+            self.save_state()
+
+    def set_pdf(self, path):
         try:
             count = len(PdfReader(path).pages)
         except Exception as error:  # broken or password-protected PDFs raise many kinds of errors
             messagebox.showerror("Can't open this PDF", str(error))
-            return
-        self.pdf_path = Path(path)
+            return False
+        self.pdf_path = path
         self.file_label.configure(text=self.pdf_path.name)
         self.pages_label.configure(text=f"{count} page{'' if count == 1 else 's'}")
-        self.set_status("Ready to convert")
+        return True
 
     def convert_or_cancel(self):
         if self.cancel_event:
@@ -257,21 +304,18 @@ class AudiobookApp:
             self.choose_pdf()
             if not self.pdf_path:
                 return
-        self.unload_audio()
         pages = self.pages_entry.get().strip()
         if pages.lower() == "all":
             pages = ""
-        self.conversions += 1
-        output = self.temp_dir / f"audio-{self.conversions}.mp3"
-        self.audio_name = f"{self.pdf_path.stem}.mp3"
+        self.save_state()
 
         self.cancel_event = threading.Event()
         self.convert_button.configure(text="Cancel", fg_color=CHIP, hover_color=CHIP_HOVER, text_color=TEXT)
         self.progress.set(0)
         self.set_status("Reading the PDF…")
         threading.Thread(target=self.run_conversion, daemon=True,
-                         args=(self.pdf_path, pages, VOICES[self.voice_menu.get()], self.speed.value, output,
-                               self.cancel_event)).start()
+                         args=(self.pdf_path, pages, VOICES[self.voice_menu.get()], self.speed.value,
+                               NEW_AUDIO_FILE, self.cancel_event)).start()
 
     def run_conversion(self, pdf_path, pages, voice, rate, output, cancel):
         """Runs in a background thread so the window stays responsive; reports back through self.events.
@@ -297,7 +341,7 @@ class AudiobookApp:
             self.events.put(("error", f"Something went wrong: {type(error).__name__}: {error}\n\n"
                                       "Finished pages are saved: press Convert again to continue."))
         else:
-            self.events.put(("done", output))
+            self.events.put(("done", pdf_path))
 
     def handle_events(self):
         while True:
@@ -310,7 +354,7 @@ class AudiobookApp:
                 action = {"ocr": "Recognizing scanned page", "speak": "Speaking page",
                           "saved": "Already done: page"}[stage]
                 self.progress.set(done / total)
-                self.set_status(f"{action} {number}  ·  {done + 1} of {total}")
+                self.set_status(f"{action} {number}  ·  {done} of {total} done")
             elif kind == "done":
                 self.conversion_done(data[0])
             elif kind == "cancelled":
@@ -323,14 +367,12 @@ class AudiobookApp:
         self.convert_button.configure(state="normal", text="Convert to audio", fg_color=ACCENT,
                                       hover_color=ACCENT_HOVER, text_color=WHITE)
 
-    def conversion_done(self, output):
+    def conversion_done(self, pdf_path):
         self.conversion_finished()
         self.progress.set(1)
-        self.audio_path = output
-        self.saved = False
-        self.duration = output.stat().st_size / BYTES_PER_SECOND
-        pygame.mixer.music.load(output)
-        self.set_player_enabled(True)
+        self.unload_audio()             # the previous audiobook is replaced by the new one
+        NEW_AUDIO_FILE.replace(AUDIO_FILE)
+        self.load_audio(f"{pdf_path.stem}.mp3", position=0, saved=False)
         self.set_status(f"Done! {format_time(self.duration)} of audio, press ▶ to listen", GOOD)
 
     def conversion_cancelled(self):
@@ -355,6 +397,7 @@ class AudiobookApp:
             messagebox.showerror("Couldn't save the MP3", str(error))
             return False
         self.saved = True
+        self.save_state()
         self.set_status(f"Saved to {target}", GOOD)
         return True
 
@@ -366,6 +409,18 @@ class AudiobookApp:
         return self.save_mp3() if answer else True
 
     # ---------- Player ----------
+    def load_audio(self, name, position, saved):
+        self.audio_path = AUDIO_FILE
+        self.audio_name = name
+        self.saved = saved
+        self.duration = AUDIO_FILE.stat().st_size / BYTES_PER_SECOND
+        pygame.mixer.music.load(AUDIO_FILE)
+        self.state = "stopped"
+        self.offset = position if 0 < position < self.duration - 1 else 0
+        self.set_player_enabled(True)
+        self.update_player()
+        self.save_state()
+
     def position(self):
         if self.state == "stopped":
             return self.offset
@@ -375,6 +430,7 @@ class AudiobookApp:
         if self.state == "playing":
             pygame.mixer.music.pause()
             self.state = "paused"
+            self.save_state()
         elif self.state == "paused":
             pygame.mixer.music.unpause()
             self.state = "playing"
@@ -392,6 +448,7 @@ class AudiobookApp:
         self.state = "stopped"
         self.offset = 0
         self.update_player()
+        self.save_state()
 
     def seek(self, seconds):
         if self.state == "playing":
@@ -402,6 +459,7 @@ class AudiobookApp:
             self.state = "stopped"
             self.offset = seconds
         self.update_player()
+        self.save_state()
 
     def on_slide(self, value):
         self.dragging = True
@@ -416,6 +474,7 @@ class AudiobookApp:
         if self.state == "playing" and not pygame.mixer.music.get_busy():
             self.state = "stopped"     # reached the end
             self.offset = 0
+            self.save_state()
         self.play_button.configure(text="❚❚" if self.state == "playing" else "▶")
         if self.dragging or not self.duration:
             return
@@ -445,7 +504,10 @@ class AudiobookApp:
     def tick(self):
         self.handle_events()
         self.update_player()
-        self.root.after(TICK_MS, self.tick)
+        self.ticks += 1
+        if self.state == "playing" and self.ticks % SAVE_EVERY == 0:
+            self.save_state()           # so even a crash loses at most a few seconds
+        self.tick_job = self.root.after(TICK_MS, self.tick)
 
     def quit(self):
         if self.cancel_event:
@@ -453,10 +515,9 @@ class AudiobookApp:
                                        "Finished pages are kept, so next time Convert continues from there."):
                 return
             self.cancel_event.set()
-        elif not self.saved and not self.confirm_discard("Quit?"):
-            return
+        self.save_state()               # the audiobook stays in DATA_DIR, so nothing is lost on quit
+        self.root.after_cancel(self.tick_job)
         pygame.mixer.quit()
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
         self.root.destroy()
 
 

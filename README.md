@@ -16,9 +16,10 @@ Text-to-speech comes from Microsoft Edge's online neural voices via [edge-tts](h
 - Cleans the text so it reads naturally: re-joins words hyphenated across lines and merges broken lines
 - Read the whole book or only selected pages, e.g. `1-3, 7`
 - Choose a voice and speaking speed
-- Shows progress page by page and saves everything to one MP3 file
+- Speaks 3 pages at a time and saves everything to one MP3 file, in page order
 - Built for long books: every page is retried up to 3 times if the connection drops, a conversion can be cancelled, and finished pages are kept (in `~/Library/Caches/pdf-to-audiobook`), so Convert continues where it stopped instead of starting over
-- Asks before quitting or converting again while your audiobook isn't saved yet
+- Remembers your last audiobook and where you stopped listening: reopen the app and press ▶ to continue. The book, voice and speed you picked are restored too
+- You can keep listening while the next book converts; it asks before replacing an audiobook you haven't saved
 
 ## Setup
 
@@ -39,7 +40,9 @@ python3 app.py
 1. **Book**: choose a PDF and see how many pages it has
 2. **Voice**: pick a voice (English, Ukrainian, German), a speed (0.75×–1.5×) and optionally which pages to read
 3. **Convert to audio**: a progress bar shows which page is being spoken, and the window stays responsive
-4. **Listen**: play / pause / stop and drag the slider to jump anywhere, then **Save MP3…** to keep the audiobook
+4. **Listen**: play / pause / stop and drag the slider to jump anywhere, then **Save MP3…** to keep a copy wherever you like
+
+The app keeps the latest audiobook and your listening position in `~/Library/Application Support/PDF to Audiobook`, so closing it never loses your place.
 
 Light and dark theme, switchable with the ☀ / ☾ button.
 
@@ -62,7 +65,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests replace the network and OCR with fakes, so they run offline in under a second. They cover page ranges, text cleanup, page-number filtering, retries after a dropped connection, and cancelling and resuming a conversion.
+The tests replace the network and OCR with fakes, so they run offline in under a second. They cover page ranges, text cleanup, page-number filtering, retries after a dropped connection, and cancelling and resuming a conversion, and speaking pages in parallel while keeping them in order.
 
 ## Why edge-tts?
 

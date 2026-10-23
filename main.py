@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import aiohttp
@@ -27,6 +28,8 @@ except ImportError:  # OCR uses Apple Vision, so it is only available on macOS
 
 DEFAULT_VOICE = "en-US-AriaNeural"
 RETRIES = 3                 # attempts per page before giving up
+STALL_SECONDS = 30          # no audio for this long = the connection is stuck, try again
+PARALLEL_PAGES = 3          # pages spoken at the same time; more may get us rate-limited by the free service
 CACHE_DIR = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache") / "pdf-to-audiobook"
 CACHE_DAYS = 30             # unfinished conversions older than this are deleted
 PAGE_NUMBER = re.compile(r"^\W*\d{1,4}\W*$")   # "9", "- 12 -", "8;"
@@ -119,14 +122,19 @@ async def speak_page(text, voice, rate, path, cancel=None):
     for attempt in range(1, RETRIES + 1):
         try:
             communicate = edge_tts.Communicate(text, voice, rate=rate)
-            # aclosing() closes the connection properly even when we stop halfway (cancel)
+            loop = asyncio.get_running_loop()
+            # aclosing() closes the connection properly even when we stop halfway (cancel or stall)
             async with contextlib.aclosing(communicate.stream()) as stream:
-                with open(part, "wb") as file:
-                    async for chunk in stream:
-                        if cancel and cancel.is_set():
-                            raise Cancelled
-                        if chunk["type"] == "audio":
-                            file.write(chunk["data"])
+                # the service sometimes goes silent without closing the connection: the deadline
+                # moves forward with every chunk, so only a real stall raises TimeoutError
+                async with asyncio.timeout(STALL_SECONDS) as deadline:
+                    with open(part, "wb") as file:
+                        async for chunk in stream:
+                            deadline.reschedule(loop.time() + STALL_SECONDS)
+                            if cancel and cancel.is_set():
+                                raise Cancelled
+                            if chunk["type"] == "audio":
+                                file.write(chunk["data"])
             part.replace(path)
             return True
         except edge_tts.exceptions.NoAudioReceived:
@@ -138,9 +146,9 @@ async def speak_page(text, voice, rate, path, cancel=None):
 
 
 def print_progress(done, total, number, stage):
-    """Called before each page; done = pages already finished, stage = "ocr", "speak" or "saved"."""
+    """Called when work on a page starts; done = pages finished so far, stage = "ocr", "speak" or "saved"."""
     action = {"ocr": "recognizing scanned page", "speak": "speaking page", "saved": "already done: page"}[stage]
-    print(f"  [{done + 1}/{total}] {action} {number}")
+    print(f"  [{done}/{total} done] {action} {number}")
 
 
 def convert(pdf_path, page_spec, voice, rate, output, on_progress=print_progress, cancel=None):
@@ -158,34 +166,17 @@ def convert(pdf_path, page_spec, voice, rate, output, on_progress=print_progress
     work_dir.mkdir(parents=True, exist_ok=True)
     work_dir.touch()                    # mark as recently used for prune_cache
     scan = None
-    spoken = []
 
-    for done, i in enumerate(indexes):
-        if cancel and cancel.is_set():
-            raise Cancelled
-        number = i + 1
-        audio = work_dir / f"page-{number:04d}.mp3"
-        silent = work_dir / f"page-{number:04d}.silent"     # remembers pages with nothing to read
-        if audio.exists():
-            on_progress(done, len(indexes), number, "saved")
-            spoken.append(audio)
-            continue
-        if silent.exists():
-            continue
-
+    def read_page(i, done):
+        nonlocal scan
         text = drop_page_numbers(reader.pages[i].extract_text() or "")
         if not text.strip() and ocrmac:
-            on_progress(done, len(indexes), number, "ocr")
+            on_progress(done, len(indexes), i + 1, "ocr")
             scan = scan or pdfium.PdfDocument(pdf_path)
             text = ocr_page(scan, i, voice_language(voice))
-        text = clean_text(text)
+        return clean_text(text)
 
-        on_progress(done, len(indexes), number, "speak")
-        if text and asyncio.run(speak_page(text, voice, rate, audio, cancel)):
-            spoken.append(audio)
-        else:
-            silent.touch()
-
+    spoken = asyncio.run(speak_pages(indexes, read_page, work_dir, voice, rate, on_progress, cancel))
     if not spoken:
         raise ValueError("No text found on these pages."
                          + ("" if ocrmac else " Scanned pages need OCR, which only works on macOS."))
@@ -196,6 +187,59 @@ def convert(pdf_path, page_spec, voice, rate, output, on_progress=print_progress
     if not page_spec:
         shutil.rmtree(work_dir, ignore_errors=True)     # the whole book is done, no need to keep pages
     return output
+
+
+async def speak_pages(indexes, read_page, work_dir, voice, rate, on_progress, cancel):
+    """Speak up to PARALLEL_PAGES pages at once; return the finished page files in page order.
+
+    Pages are read (and OCR'd) one at a time on a single helper thread, because pdfium
+    must not be used from several threads at once. A page is only read when a speaking
+    slot is free, so reading never runs far ahead of speaking.
+    """
+    loop = asyncio.get_running_loop()
+    slots = asyncio.Semaphore(PARALLEL_PAGES)
+    finished = {}                       # page number -> audio file, or None if there was nothing to read
+    total = len(indexes)
+
+    async def speak(number, text, audio, silent):
+        try:
+            if text and await speak_page(text, voice, rate, audio, cancel):
+                finished[number] = audio
+            else:
+                silent.touch()
+                finished[number] = None
+        finally:
+            slots.release()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as reader_thread:
+            async with asyncio.TaskGroup() as group:
+                for i in indexes:
+                    number = i + 1
+                    audio = work_dir / f"page-{number:04d}.mp3"
+                    silent = work_dir / f"page-{number:04d}.silent"     # remembers pages with nothing to read
+                    if audio.exists():
+                        on_progress(len(finished), total, number, "saved")
+                        finished[number] = audio
+                        continue
+                    if silent.exists():
+                        finished[number] = None
+                        continue
+
+                    await slots.acquire()
+                    if cancel and cancel.is_set():
+                        slots.release()
+                        raise Cancelled
+                    try:
+                        text = await loop.run_in_executor(reader_thread, read_page, i, len(finished))
+                    except BaseException:
+                        slots.release()
+                        raise
+                    on_progress(len(finished), total, number, "speak")
+                    group.create_task(speak(number, text, audio, silent))
+    except ExceptionGroup as errors:
+        raise errors.exceptions[0] from None    # report the first real error, e.g. Cancelled or a network error
+    return [audio for number, audio in sorted(finished.items()) if audio]
 
 
 async def list_voices(language):

@@ -166,3 +166,49 @@ def test_convert_with_no_text_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "ocr_page", lambda *a: "")
     with pytest.raises(ValueError, match="No text"):
         M.convert(pdf, "", "en-US-AriaNeural", "+0%", tmp_path / "out.mp3", on_progress=quiet)
+
+
+def test_convert_speaks_pages_in_parallel_but_joins_them_in_order(tmp_path, monkeypatch):
+    writer = PdfWriter()
+    for _ in range(6):
+        writer.add_page(PdfReader(SAMPLE).pages[0])
+    pdf = tmp_path / "book.pdf"
+    writer.write(pdf)
+    monkeypatch.setattr(M, "CACHE_DIR", tmp_path / "cache")
+    running, most_at_once = set(), []
+
+    async def slow_speak(text, voice, rate, path, cancel=None):
+        number = int(path.stem.split("-")[1])
+        running.add(number)
+        most_at_once.append(len(running))
+        await M.asyncio.sleep(0.01 * (7 - number))     # later pages finish first
+        running.discard(number)
+        path.write_bytes(f"<{number}>".encode())
+        return True
+
+    monkeypatch.setattr(M, "speak_page", slow_speak)
+    M.convert(pdf, "", "en-US-AriaNeural", "+0%", tmp_path / "out.mp3", on_progress=quiet)
+    assert max(most_at_once) == M.PARALLEL_PAGES
+    assert (tmp_path / "out.mp3").read_bytes() == b"<1><2><3><4><5><6>"
+
+
+def test_speak_page_retries_when_the_connection_goes_silent(tmp_path, monkeypatch, no_waiting):
+    calls = {"n": 0}
+
+    class StuckOnce:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def stream(self):
+            calls["n"] += 1
+            yield {"type": "audio", "data": b"mp"}
+            if calls["n"] == 1:
+                await M.asyncio.Event().wait()      # the service stops sending, forever
+            yield {"type": "audio", "data": b"3"}
+
+    monkeypatch.setattr(M.edge_tts, "Communicate", StuckOnce)
+    monkeypatch.setattr(M, "STALL_SECONDS", 0.05)
+    path = tmp_path / "page.mp3"
+    assert M.asyncio.run(M.speak_page("Hi", "en-US-AriaNeural", "+0%", path))
+    assert calls["n"] == 2
+    assert path.read_bytes() == b"mp3"
